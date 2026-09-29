@@ -23,6 +23,7 @@ namespace cAlgo.Robots
         private double _dayStartBalance;
         private double _dailyNetProfit;
         private int _consecutiveLosses;
+        private int _lastProcessedBarIndex = -1;
         private DateTime _lastTradeTime = DateTime.MinValue;
 
         // Preserve the original SL risk for R-multiple calculations.
@@ -138,6 +139,7 @@ namespace cAlgo.Robots
             RestoreDailyState();
 
             _executionBars.BarClosed += OnExecutionBarClosed;
+            _lastProcessedBarIndex = _executionBars.Count - 1;
             Positions.Closed += OnPositionClosed;
 
             foreach (var position in Positions.FindAll(Label, Symbol.Name))
@@ -178,12 +180,17 @@ namespace cAlgo.Robots
                 (Server.Time - _lastTradeTime).TotalSeconds < CooldownSeconds)
                 return;
 
-            // Last(1) is the closed execution bar because this handler runs on BarClosed.
-            double fast = _emaFast.Result.Last(1);
-            double slow = _emaSlow.Result.Last(1);
-            double prevFast = _emaFast.Result.Last(2);
-            double prevSlow = _emaSlow.Result.Last(2);
-            double rsi = _rsi.Result.Last(1);
+            int closedIndex = _executionBars.Count - 2;
+            if (closedIndex <= _lastProcessedBarIndex)
+                return;
+            _lastProcessedBarIndex = closedIndex;
+
+            // Use the closed execution bar explicitly.
+            double fast = _emaFast.Result[closedIndex];
+            double slow = _emaSlow.Result[closedIndex];
+            double prevFast = _emaFast.Result[closedIndex - 1];
+            double prevSlow = _emaSlow.Result[closedIndex - 1];
+            double rsi = _rsi.Result[closedIndex];
 
             // Last(1) is the last closed trend bar.
             bool trendBull = _trendEmaFast.Result.Last(1) > _trendEmaSlow.Result.Last(1);
@@ -203,7 +210,7 @@ namespace cAlgo.Robots
 
         private void OpenPosition(TradeType tradeType)
         {
-            double atrPips = _atr.Result.Last(1) / Symbol.PipSize;
+            double atrPips = _atr.Result[_executionBars.Count - 2] / Symbol.PipSize;
             double stopLossPips = Clamp(
                 atrPips * AtrSlMultiplier,
                 MinStopLossPips,
@@ -228,6 +235,10 @@ namespace cAlgo.Robots
 
             if (volume > Symbol.VolumeInUnitsMax)
                 volume = Symbol.VolumeInUnitsMax;
+
+            volume = Symbol.NormalizeVolumeInUnits(volume, RoundingMode.Down);
+            if (volume < Symbol.VolumeInUnitsMin)
+                return;
 
             var result = ExecuteMarketOrder(
                 tradeType,
@@ -281,7 +292,7 @@ namespace cAlgo.Robots
 
                 if (currentR >= TrailingTriggerR)
                 {
-                    double atrPips = _atr.Result.Last(0) / Symbol.PipSize;
+                    double atrPips = _atr.Result.LastValue / Symbol.PipSize;
                     double trailPips = Math.Max(1.0, atrPips * TrailingAtrMultiplier);
 
                     double trailPrice = position.TradeType == TradeType.Buy

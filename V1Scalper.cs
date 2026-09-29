@@ -359,7 +359,13 @@ namespace cAlgo.Robots
                 return;
 
             _initialRiskPips.Remove(position.Id);
-            RestoreDailyState();
+
+            _dailyNetProfit += position.NetProfit;
+
+            if (position.NetProfit < 0)
+                _consecutiveLosses++;
+            else if (position.NetProfit > 0)
+                _consecutiveLosses = 0;
 
             Print("CLOSED | Net={0:F2} | Daily={1:F2} | ConsecutiveLosses={2}",
                 position.NetProfit, _dailyNetProfit, _consecutiveLosses);

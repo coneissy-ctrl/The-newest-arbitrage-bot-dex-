@@ -1,4 +1,6 @@
 using System;
+using System.Linq;
+using System.Collections.Generic;
 using cAlgo.API;
 using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
@@ -9,14 +11,22 @@ namespace cAlgo.Robots
     public class V1Scalper : Robot
     {
         private const string Label = "V1_US100_SCALPER";
+
+        private Bars _executionBars;
         private Bars _trendBars;
-        private ExponentialMovingAverage _emaFast, _emaSlow, _trendEmaFast, _trendEmaSlow;
+        private ExponentialMovingAverage _emaFast, _emaSlow;
+        private ExponentialMovingAverage _trendEmaFast, _trendEmaSlow;
         private RelativeStrengthIndex _rsi;
         private AverageTrueRange _atr;
+
         private DateTime _sessionDate;
+        private double _dayStartBalance;
         private double _dailyNetProfit;
         private int _consecutiveLosses;
         private DateTime _lastTradeTime = DateTime.MinValue;
+
+        // Preserve the original SL risk for R-multiple calculations.
+        private readonly Dictionary<int, double> _initialRiskPips = new Dictionary<int, double>();
 
         [Parameter("Symbol", Group = "Market", DefaultValue = "US100")]
         public string TradeSymbol { get; set; }
@@ -113,20 +123,44 @@ namespace cAlgo.Robots
             if (!string.Equals(Symbol.Name, TradeSymbol, StringComparison.OrdinalIgnoreCase))
                 Print("WARNING: attached symbol is {0}; configured symbol is {1}. Use the broker's exact US100 symbol.", Symbol.Name, TradeSymbol);
 
+            _executionBars = MarketData.GetBars(ExecutionTimeFrame, Symbol.Name);
             _trendBars = MarketData.GetBars(TrendTimeFrame, Symbol.Name);
-            _emaFast = Indicators.ExponentialMovingAverage(Bars.ClosePrices, FastEmaPeriod);
-            _emaSlow = Indicators.ExponentialMovingAverage(Bars.ClosePrices, SlowEmaPeriod);
-            _rsi = Indicators.RelativeStrengthIndex(Bars.ClosePrices, RsiPeriod);
-            _atr = Indicators.AverageTrueRange(Bars, AtrPeriod, MovingAverageType.Exponential);
+
+            _emaFast = Indicators.ExponentialMovingAverage(_executionBars.ClosePrices, FastEmaPeriod);
+            _emaSlow = Indicators.ExponentialMovingAverage(_executionBars.ClosePrices, SlowEmaPeriod);
+            _rsi = Indicators.RelativeStrengthIndex(_executionBars.ClosePrices, RsiPeriod);
+            _atr = Indicators.AverageTrueRange(_executionBars, AtrPeriod, MovingAverageType.Exponential);
+
             _trendEmaFast = Indicators.ExponentialMovingAverage(_trendBars.ClosePrices, FastEmaPeriod);
             _trendEmaSlow = Indicators.ExponentialMovingAverage(_trendBars.ClosePrices, SlowEmaPeriod);
 
             _sessionDate = Server.Time.Date;
+            RestoreDailyState();
+
+            _executionBars.BarClosed += OnExecutionBarClosed;
             Positions.Closed += OnPositionClosed;
-            Print("V1 Scalper started | Symbol={0} | Execution={1} | Trend={2}", Symbol.Name, ExecutionTimeFrame, TrendTimeFrame);
+
+            foreach (var position in Positions.FindAll(Label, Symbol.Name))
+                RegisterInitialRisk(position);
+
+            Print("V1 Scalper started | Symbol={0} | Execution={1} | Trend={2}",
+                Symbol.Name, ExecutionTimeFrame, TrendTimeFrame);
         }
 
-        protected override void OnBar()
+        protected override void OnStop()
+        {
+            _executionBars.BarClosed -= OnExecutionBarClosed;
+            Positions.Closed -= OnPositionClosed;
+        }
+
+        protected override void OnTick()
+        {
+            ResetDailyStateIfNeeded();
+            ManageSafety();
+            ManagePositions();
+        }
+
+        private void OnExecutionBarClosed(BarClosedEventArgs args)
         {
             ResetDailyStateIfNeeded();
             ManageSafety();
@@ -134,23 +168,30 @@ namespace cAlgo.Robots
             if (!CanTrade() || (OnePositionOnly && HasOpenPosition()))
                 return;
 
-            if (Bars.Count < Math.Max(SlowEmaPeriod, AtrPeriod) + 10 || _trendBars.Count < SlowEmaPeriod + 10)
+            if (_executionBars.Count < Math.Max(SlowEmaPeriod, AtrPeriod) + 5 ||
+                _trendBars.Count < SlowEmaPeriod + 5)
                 return;
 
             double spreadPips = (Symbol.Ask - Symbol.Bid) / Symbol.PipSize;
-            if (spreadPips > MaxSpreadPips || (Server.Time - _lastTradeTime).TotalSeconds < CooldownSeconds)
+
+            if (spreadPips > MaxSpreadPips ||
+                (Server.Time - _lastTradeTime).TotalSeconds < CooldownSeconds)
                 return;
 
-            bool trendBull = _trendEmaFast.Result.LastValue > _trendEmaSlow.Result.LastValue;
-            bool trendBear = _trendEmaFast.Result.LastValue < _trendEmaSlow.Result.LastValue;
-            double fast = _emaFast.Result.LastValue;
-            double slow = _emaSlow.Result.LastValue;
-            double rsi = _rsi.Result.LastValue;
-            double prevFast = _emaFast.Result.Last(1);
-            double prevSlow = _emaSlow.Result.Last(1);
+            // Last(1) is the closed execution bar because this handler runs on BarClosed.
+            double fast = _emaFast.Result.Last(1);
+            double slow = _emaSlow.Result.Last(1);
+            double prevFast = _emaFast.Result.Last(2);
+            double prevSlow = _emaSlow.Result.Last(2);
+            double rsi = _rsi.Result.Last(1);
+
+            // Last(1) is the last closed trend bar.
+            bool trendBull = _trendEmaFast.Result.Last(1) > _trendEmaSlow.Result.Last(1);
+            bool trendBear = _trendEmaFast.Result.Last(1) < _trendEmaSlow.Result.Last(1);
 
             bool bullishCross = prevFast <= prevSlow && fast > slow;
             bool bearishCross = prevFast >= prevSlow && fast < slow;
+
             bool buyMomentum = rsi >= RsiBuyMin && Symbol.Bid > fast;
             bool sellMomentum = rsi <= RsiSellMax && Symbol.Ask < fast;
 
@@ -160,42 +201,69 @@ namespace cAlgo.Robots
                 OpenPosition(TradeType.Sell);
         }
 
-        protected override void OnTick()
-        {
-            ResetDailyStateIfNeeded();
-            ManagePositions();
-        }
-
         private void OpenPosition(TradeType tradeType)
         {
-            double atrPips = _atr.Result.LastValue / Symbol.PipSize;
-            double stopLossPips = Clamp(atrPips * AtrSlMultiplier, MinStopLossPips, MaxStopLossPips);
+            double atrPips = _atr.Result.Last(1) / Symbol.PipSize;
+            double stopLossPips = Clamp(
+                atrPips * AtrSlMultiplier,
+                MinStopLossPips,
+                MaxStopLossPips);
+
             double takeProfitPips = stopLossPips * TpSlRatio;
             double riskMoney = Account.Balance * RiskPercent / 100.0;
-            double volume = Symbol.VolumeForFixedRisk(riskMoney, stopLossPips, RoundingMode.Down);
+
+            double volume = Symbol.VolumeForFixedRisk(
+                riskMoney,
+                stopLossPips,
+                RoundingMode.Down);
+
             volume = Symbol.NormalizeVolumeInUnits(volume, RoundingMode.Down);
 
             if (volume < Symbol.VolumeInUnitsMin)
-                return;
-
-            var result = ExecuteMarketOrder(tradeType, Symbol.Name, volume, Label, stopLossPips, takeProfitPips);
-
-            if (result.IsSuccessful)
             {
-                _lastTradeTime = Server.Time;
-                Print("ENTRY {0} | Vol={1} | SL={2:F1} | TP={3:F1} | Spread={4:F1}",
-                    tradeType, volume, stopLossPips, takeProfitPips,
-                    (Symbol.Ask - Symbol.Bid) / Symbol.PipSize);
+                Print("ENTRY SKIPPED: calculated volume {0} is below minimum {1}.",
+                    volume, Symbol.VolumeInUnitsMin);
+                return;
             }
-            else
+
+            if (volume > Symbol.VolumeInUnitsMax)
+                volume = Symbol.VolumeInUnitsMax;
+
+            var result = ExecuteMarketOrder(
+                tradeType,
+                Symbol.Name,
+                volume,
+                Label,
+                stopLossPips,
+                takeProfitPips);
+
+            if (!result.IsSuccessful)
+            {
                 Print("ENTRY FAILED {0}: {1}", tradeType, result.Error);
+                return;
+            }
+
+            _lastTradeTime = Server.Time;
+
+            if (result.Position != null)
+                _initialRiskPips[result.Position.Id] = stopLossPips;
+
+            Print("ENTRY {0} | Vol={1} | SL={2:F1} | TP={3:F1} | Spread={4:F1}",
+                tradeType,
+                volume,
+                stopLossPips,
+                takeProfitPips,
+                (Symbol.Ask - Symbol.Bid) / Symbol.PipSize);
         }
 
         private void ManagePositions()
         {
             foreach (var position in Positions.FindAll(Label, Symbol.Name))
             {
-                double initialRiskPips = GetInitialRiskPips(position);
+                RegisterInitialRisk(position);
+
+                double initialRiskPips = _initialRiskPips[position.Id];
+
                 if (initialRiskPips <= 0)
                     continue;
 
@@ -208,26 +276,29 @@ namespace cAlgo.Robots
                         : position.EntryPrice - BreakEvenOffsetPips * Symbol.PipSize;
 
                     if (ShouldImproveStop(position, bePrice))
-                        ModifyPosition(position, bePrice, position.TakeProfit, ProtectionType.Absolute);
+                        ModifyPosition(position, bePrice, position.TakeProfit);
                 }
 
                 if (currentR >= TrailingTriggerR)
                 {
-                    double atrPips = _atr.Result.LastValue / Symbol.PipSize;
+                    double atrPips = _atr.Result.Last(0) / Symbol.PipSize;
                     double trailPips = Math.Max(1.0, atrPips * TrailingAtrMultiplier);
+
                     double trailPrice = position.TradeType == TradeType.Buy
                         ? Symbol.Bid - trailPips * Symbol.PipSize
                         : Symbol.Ask + trailPips * Symbol.PipSize;
 
                     if (ShouldImproveStop(position, trailPrice))
-                        ModifyPosition(position, trailPrice, position.TakeProfit, ProtectionType.Absolute);
+                        ModifyPosition(position, trailPrice, position.TakeProfit);
                 }
             }
         }
 
         private void ManageSafety()
         {
-            if (_dailyNetProfit <= -(Account.Balance * MaxDailyLossPercent / 100.0))
+            double maxDailyLossMoney = _dayStartBalance * MaxDailyLossPercent / 100.0;
+
+            if (_dailyNetProfit <= -maxDailyLossMoney)
                 CloseBotPositions("Daily loss limit reached");
 
             if (_consecutiveLosses >= MaxConsecutiveLosses)
@@ -236,10 +307,14 @@ namespace cAlgo.Robots
 
         private bool CanTrade()
         {
+            if (!Symbol.IsTradingEnabled)
+                return false;
+
             if (Server.Time.Hour < StartHourUtc || Server.Time.Hour > EndHourUtc)
                 return false;
 
-            if (Server.Time.DayOfWeek == DayOfWeek.Saturday || Server.Time.DayOfWeek == DayOfWeek.Sunday)
+            if (Server.Time.DayOfWeek == DayOfWeek.Saturday ||
+                Server.Time.DayOfWeek == DayOfWeek.Sunday)
                 return false;
 
             if (!TradeMonday && Server.Time.DayOfWeek == DayOfWeek.Monday)
@@ -248,7 +323,9 @@ namespace cAlgo.Robots
             if (!TradeFriday && Server.Time.DayOfWeek == DayOfWeek.Friday)
                 return false;
 
-            if (_dailyNetProfit <= -(Account.Balance * MaxDailyLossPercent / 100.0) ||
+            double maxDailyLossMoney = _dayStartBalance * MaxDailyLossPercent / 100.0;
+
+            if (_dailyNetProfit <= -maxDailyLossMoney ||
                 _consecutiveLosses >= MaxConsecutiveLosses)
                 return false;
 
@@ -258,26 +335,66 @@ namespace cAlgo.Robots
         private int CountTradesToday()
         {
             int count = 0;
+
             foreach (var trade in History.FindAll(Label, Symbol.Name))
-                if (trade.EntryTime.Date == Server.Time.Date) count++;
+            {
+                if (trade.EntryTime.Date == Server.Time.Date)
+                    count++;
+            }
 
             foreach (var position in Positions.FindAll(Label, Symbol.Name))
-                if (position.EntryTime.Date == Server.Time.Date) count++;
+            {
+                if (position.EntryTime.Date == Server.Time.Date)
+                    count++;
+            }
 
             return count;
         }
 
         private void OnPositionClosed(PositionClosedEventArgs args)
         {
-            if (args.Position.Label != Label || args.Position.SymbolName != Symbol.Name)
+            var position = args.Position;
+
+            if (position.Label != Label || position.SymbolName != Symbol.Name)
                 return;
 
-            _dailyNetProfit += args.Position.NetProfit;
+            _initialRiskPips.Remove(position.Id);
+            RestoreDailyState();
 
-            if (args.Position.NetProfit < 0)
-                _consecutiveLosses++;
-            else if (args.Position.NetProfit > 0)
-                _consecutiveLosses = 0;
+            Print("CLOSED | Net={0:F2} | Daily={1:F2} | ConsecutiveLosses={2}",
+                position.NetProfit, _dailyNetProfit, _consecutiveLosses);
+        }
+
+        private void RestoreDailyState()
+        {
+            _dailyNetProfit = 0;
+            _consecutiveLosses = 0;
+
+            var trades = History.FindAll(Label, Symbol.Name);
+
+            foreach (var trade in trades)
+            {
+                if (trade.ClosingTime.Date == Server.Time.Date)
+                    _dailyNetProfit += trade.NetProfit;
+            }
+
+            var ordered = trades
+                .Where(t => t.ClosingTime.Date == Server.Time.Date)
+                .OrderByDescending(t => t.ClosingTime)
+                .ToArray();
+
+            foreach (var trade in ordered)
+            {
+                if (trade.NetProfit < 0)
+                    _consecutiveLosses++;
+                else if (trade.NetProfit > 0)
+                    break;
+            }
+
+            _dayStartBalance = Account.Balance - _dailyNetProfit;
+
+            if (_dayStartBalance <= 0)
+                _dayStartBalance = Account.Balance;
         }
 
         private void ResetDailyStateIfNeeded()
@@ -286,8 +403,23 @@ namespace cAlgo.Robots
                 return;
 
             _sessionDate = Server.Time.Date;
-            _dailyNetProfit = 0;
-            _consecutiveLosses = 0;
+            RestoreDailyState();
+
+            Print("NEW TRADING DAY | StartBalance={0:F2}", _dayStartBalance);
+        }
+
+        private void RegisterInitialRisk(Position position)
+        {
+            if (_initialRiskPips.ContainsKey(position.Id))
+                return;
+
+            if (position.StopLoss.HasValue)
+            {
+                double riskPips = Math.Abs(position.EntryPrice - position.StopLoss.Value) / Symbol.PipSize;
+
+                if (riskPips > 0)
+                    _initialRiskPips[position.Id] = riskPips;
+            }
         }
 
         private bool HasOpenPosition()
@@ -297,26 +429,22 @@ namespace cAlgo.Robots
 
         private void CloseBotPositions(string reason)
         {
-            foreach (var position in Positions.FindAll(Label, Symbol.Name))
+            var positions = Positions.FindAll(Label, Symbol.Name);
+
+            foreach (var position in positions)
                 ClosePosition(position);
 
             Print("SAFETY STOP: {0}", reason);
         }
 
-        private double GetInitialRiskPips(Position position)
-        {
-            if (!position.StopLoss.HasValue)
-                return 0;
-
-            return Math.Abs(position.EntryPrice - position.StopLoss.Value) / Symbol.PipSize;
-        }
-
         private bool ShouldImproveStop(Position position, double candidate)
         {
             if (position.TradeType == TradeType.Buy)
-                return !position.StopLoss.HasValue || candidate > position.StopLoss.Value + Symbol.PipSize;
+                return !position.StopLoss.HasValue ||
+                       candidate > position.StopLoss.Value + Symbol.PipSize;
 
-            return !position.StopLoss.HasValue || candidate < position.StopLoss.Value - Symbol.PipSize;
+            return !position.StopLoss.HasValue ||
+                   candidate < position.StopLoss.Value - Symbol.PipSize;
         }
 
         private static double Clamp(double value, double min, double max)
@@ -326,13 +454,14 @@ namespace cAlgo.Robots
 
         protected override double GetFitness(GetFitnessArgs args)
         {
-            if (args.TotalTrades < 50 || args.MaxEquityDrawdownPercentages >= 20)
+            if (args.TotalTrades < 50 ||
+                args.MaxEquityDrawdownPercentages >= 20 ||
+                args.NetProfit <= 0 ||
+                args.ProfitFactor <= 0)
                 return double.MinValue;
 
-            double profitFactor = Math.Max(0.01, args.ProfitFactor);
             double drawdownPenalty = 1.0 + args.MaxEquityDrawdownPercentages / 10.0;
-            double tradeQuality = Math.Max(0.5, Math.Min(2.0, args.AverageTrade));
-            double fitness = args.NetProfit * profitFactor * tradeQuality / drawdownPenalty;
+            double fitness = args.NetProfit * args.ProfitFactor / drawdownPenalty;
 
             if (double.IsNaN(fitness) || double.IsInfinity(fitness))
                 return double.MinValue;

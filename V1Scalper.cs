@@ -232,7 +232,19 @@ namespace cAlgo.Robots
                 MaxStopLossPips);
 
             double takeProfitPips = stopLossPips * TpSlRatio;
+
+            // Respect the broker's symbol-specific minimum protection distances.
+            double entryPrice = tradeType == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
+            double minSlPips = GetMinimumDistancePips(Symbol.MinStopLossDistance, entryPrice);
+            double minTpPips = GetMinimumDistancePips(Symbol.MinTakeProfitDistance, entryPrice);
+
+            stopLossPips = Math.Max(stopLossPips, minSlPips);
+            takeProfitPips = Math.Max(takeProfitPips, minTpPips);
+
             double riskMoney = Account.Balance * RiskPercent / 100.0;
+
+            if (riskMoney <= 0 || stopLossPips <= 0 || takeProfitPips <= 0)
+                return;
 
             double volume = Symbol.VolumeForFixedRisk(
                 riskMoney,
@@ -488,6 +500,18 @@ namespace cAlgo.Robots
 
             return !position.StopLoss.HasValue ||
                    candidate < position.StopLoss.Value - Symbol.PipSize;
+        }
+
+        private double GetMinimumDistancePips(double distance, double referencePrice)
+        {
+            if (distance <= 0 || referencePrice <= 0 || Symbol.PipSize <= 0)
+                return 0;
+
+            if (Symbol.MinDistanceType == SymbolMinDistanceType.Pips)
+                return distance;
+
+            // Percentage distance is expressed as a percentage of price.
+            return referencePrice * distance / 100.0 / Symbol.PipSize;
         }
 
         private static double Clamp(double value, double min, double max)

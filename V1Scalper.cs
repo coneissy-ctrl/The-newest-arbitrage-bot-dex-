@@ -139,7 +139,7 @@ namespace cAlgo.Robots
             RestoreDailyState();
 
             _executionBars.BarClosed += OnExecutionBarClosed;
-            _lastProcessedBarIndex = _executionBars.Count - 1;
+            _lastProcessedBarIndex = -1;
             Positions.Closed += OnPositionClosed;
 
             foreach (var position in Positions.FindAll(Label, Symbol.Name))
@@ -180,7 +180,7 @@ namespace cAlgo.Robots
                 (Server.Time - _lastTradeTime).TotalSeconds < CooldownSeconds)
                 return;
 
-            int closedIndex = _executionBars.Count - 2;
+            int closedIndex = _executionBars.Count - 1;
             if (closedIndex <= _lastProcessedBarIndex)
                 return;
             _lastProcessedBarIndex = closedIndex;
@@ -192,9 +192,19 @@ namespace cAlgo.Robots
             double prevSlow = _emaSlow.Result[closedIndex - 1];
             double rsi = _rsi.Result[closedIndex];
 
-            // Last(1) is the last closed trend bar.
-            bool trendBull = _trendEmaFast.Result.Last(1) > _trendEmaSlow.Result.Last(1);
-            bool trendBear = _trendEmaFast.Result.Last(1) < _trendEmaSlow.Result.Last(1);
+            // Align the trend filter to the execution bar and use only a closed trend bar.
+            int trendIndex = _trendBars.OpenTimes.GetIndexByTime(_executionBars.OpenTimes[closedIndex]);
+            if (trendIndex < 0)
+                return;
+
+            if (trendIndex >= _trendBars.Count - 1)
+                trendIndex = _trendBars.Count - 2;
+
+            if (trendIndex < 1)
+                return;
+
+            bool trendBull = _trendEmaFast.Result[trendIndex] > _trendEmaSlow.Result[trendIndex];
+            bool trendBear = _trendEmaFast.Result[trendIndex] < _trendEmaSlow.Result[trendIndex];
 
             bool bullishCross = prevFast <= prevSlow && fast > slow;
             bool bearishCross = prevFast >= prevSlow && fast < slow;
@@ -210,7 +220,7 @@ namespace cAlgo.Robots
 
         private void OpenPosition(TradeType tradeType)
         {
-            double atrPips = _atr.Result[_executionBars.Count - 2] / Symbol.PipSize;
+            double atrPips = _atr.Result[_executionBars.Count - 1] / Symbol.PipSize;
             double stopLossPips = Clamp(
                 atrPips * AtrSlMultiplier,
                 MinStopLossPips,

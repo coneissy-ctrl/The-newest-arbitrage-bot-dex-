@@ -200,7 +200,10 @@ namespace cAlgo.Robots
             if (trendIndex < 1)
                 return;
 
-            trendIndex--;
+            if (_trendBars.OpenTimes[trendIndex] == _executionBars.OpenTimes[closedIndex])
+            {
+                trendIndex--;
+            }
 
             if (trendIndex >= _trendBars.Count)
                 return;

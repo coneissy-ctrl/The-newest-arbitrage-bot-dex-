@@ -25,6 +25,7 @@ namespace cAlgo.Robots
         private int _consecutiveLosses;
         private int _lastProcessedBarIndex = -1;
         private DateTime _lastTradeTime = DateTime.MinValue;
+        private bool _safetyLocked;
 
         // Preserve the original SL risk for R-multiple calculations.
         private readonly Dictionary<int, double> _initialRiskPips = new Dictionary<int, double>();
@@ -137,6 +138,7 @@ namespace cAlgo.Robots
 
             _sessionDate = Server.Time.Date;
             RestoreDailyState();
+            _safetyLocked = false;
 
             _executionBars.BarClosed += OnExecutionBarClosed;
             _lastProcessedBarIndex = -1;
@@ -320,15 +322,21 @@ namespace cAlgo.Robots
             double maxDailyLossMoney = _dayStartBalance * MaxDailyLossPercent / 100.0;
 
             if (_dailyNetProfit <= -maxDailyLossMoney)
+            {
+                _safetyLocked = true;
                 CloseBotPositions("Daily loss limit reached");
+            }
 
             if (_consecutiveLosses >= MaxConsecutiveLosses)
+            {
+                _safetyLocked = true;
                 CloseBotPositions("Consecutive loss limit reached");
+            }
         }
 
         private bool CanTrade()
         {
-            if (!Symbol.IsTradingEnabled)
+            if (_safetyLocked || !Symbol.IsTradingEnabled)
                 return false;
 
             if (Server.Time.Hour < StartHourUtc || Server.Time.Hour > EndHourUtc)
@@ -346,7 +354,7 @@ namespace cAlgo.Robots
 
             double maxDailyLossMoney = _dayStartBalance * MaxDailyLossPercent / 100.0;
 
-            if (_dailyNetProfit <= -maxDailyLossMoney ||
+            if (_safetyLocked || _dailyNetProfit <= -maxDailyLossMoney ||
                 _consecutiveLosses >= MaxConsecutiveLosses)
                 return false;
 
@@ -431,6 +439,7 @@ namespace cAlgo.Robots
 
             _sessionDate = Server.Time.Date;
             RestoreDailyState();
+            _safetyLocked = false;
 
             Print("NEW TRADING DAY | StartBalance={0:F2}", _dayStartBalance);
         }

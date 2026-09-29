@@ -194,15 +194,15 @@ namespace cAlgo.Robots
             double prevSlow = _emaSlow.Result[closedIndex - 1];
             double rsi = _rsi.Result[closedIndex];
 
-            // Align the trend filter to the execution bar and use only a closed trend bar.
+            // Map the execution bar to its containing M5 bar, then step back
+            // one bar because that M5 bar is still forming at the M1 close.
             int trendIndex = _trendBars.OpenTimes.GetIndexByTime(_executionBars.OpenTimes[closedIndex]);
-            if (trendIndex < 0)
+            if (trendIndex < 1)
                 return;
 
-            if (trendIndex >= _trendBars.Count - 1)
-                trendIndex = _trendBars.Count - 2;
+            trendIndex--;
 
-            if (trendIndex < 1)
+            if (trendIndex >= _trendBars.Count)
                 return;
 
             bool trendBull = _trendEmaFast.Result[trendIndex] > _trendEmaSlow.Result[trendIndex];
@@ -321,10 +321,14 @@ namespace cAlgo.Robots
         {
             double maxDailyLossMoney = _dayStartBalance * MaxDailyLossPercent / 100.0;
 
+            if (_safetyLocked)
+                return;
+
             if (_dailyNetProfit <= -maxDailyLossMoney)
             {
                 _safetyLocked = true;
                 CloseBotPositions("Daily loss limit reached");
+                return;
             }
 
             if (_consecutiveLosses >= MaxConsecutiveLosses)
